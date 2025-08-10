@@ -1,10 +1,39 @@
+import os, csv, subprocess, tempfile, shutil
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import pyshark
-import csv
 
-# Wireshark 文件路径
-pcap_file = r'c:\temp\1.pcap'
-# 输出 CSV 文件路径
-csv_file = 's7_variables.csv'
+PCAP_FILE  = r'\\tsclient\D\mydoc\My WorkRecord\WorkRecord\FY2324\芬美winac\debug\telegram\3.pcapng'
+CSV_FILE   = 's7_variables.csv'
+SLICE_PKT  = 10_000            # 每片报文数（可微调）
+WORKERS    = os.cpu_count()
+
+# ---------- 把 pcap 切成 N 份 ----------
+def split_pcap(src, pkt_per_file):
+    """用 editcap 切成多个小 pcap；返回文件名列表"""
+    tmpdir = tempfile.mkdtemp(prefix='s7slice_')
+    base   = os.path.join(tmpdir, 'slice')
+    cmd = ['editcap', '-c', str(pkt_per_file), src, base + '.pcap']
+    subprocess.run(cmd, check=True)
+    return [os.path.join(tmpdir, f) for f in os.listdir(tmpdir)]
+
+# ---------- 单进程：解析一个 slice ----------
+def parse_slice(pcap_path):
+    """解析单个分片，返回 list[dict] 并本地去重"""
+    seen = set()
+    items = []
+    key_fn = lambda d: (
+        d['source_ip'], d['destination_ip'], d['operation'],
+        d['memory_type'], d['data_type'], d['offset']
+    )
+    cap = pyshark.FileCapture(pcap_path, display_filter='s7comm', keep_packets=False)
+    for pkt in cap:
+        for var in extract_s7_variables(pkt):
+            k = key_fn(var)
+            if k not in seen:
+                seen.add(k)
+                items.append(var)
+    cap.close()
+    return items
 
 def get_tcp_payload(packet):
     # 检查是否有 TCP 层
@@ -167,28 +196,49 @@ def extract_s7_variables(packet):
     return []
 
 def main():
-    seen_items = set()
-    with open(csv_file, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['source_ip','destination_ip','operation', 'memory_type','data_type','data_size','number_of_data','block_num','offset','byte_length'])
-        writer.writeheader()
-        cap = pyshark.FileCapture(pcap_file, display_filter='s7comm', keep_packets=False)
-        for packet in cap:
-            items = extract_s7_variables(packet)
-            for item in items:
-                key_fields = (
-                    item.get('source_ip'),
-                    item.get('destination_ip'),
-                    item.get('operation'),
-                    item.get('memory_type'),
-                    item.get('data_type'),
-                    item.get('offset')
-                )
-                if key_fields not in seen_items:
-                    seen_items.add(key_fields)
-                    writer.writerow(item)
-        cap.close()
+    tmpdir = None
+    try:
+        print('Step1: 切分 pcap...')
+        slices = split_pcap(PCAP_FILE, SLICE_PKT)
+        tmpdir = os.path.dirname(slices[0])
+        print(f'切成 {len(slices)} 片，存放目录 {tmpdir}')
+
+        print('Step2: 多进程解析...')
+        all_items = []
+        with ProcessPoolExecutor(max_workers=WORKERS) as pool:
+            future_to_slice = {pool.submit(parse_slice, s): s for s in slices}
+            for fut in as_completed(future_to_slice):
+                all_items.extend(fut.result())
+
+        print('Step3: 全局去重...')
+        seen = set()
+        final = []
+        key_fn = lambda d: (
+            d['source_ip'], d['destination_ip'], d['operation'],
+            d['memory_type'], d['data_type'], d['offset']
+        )
+        for it in all_items:
+            k = key_fn(it)
+            if k not in seen:
+                seen.add(k)
+                final.append(it)
+
+        print('Step4: 写 CSV...')
+        with open(CSV_FILE, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                'source_ip','destination_ip','operation',
+                'memory_type','data_type','data_size',
+                'number_of_data','block_num','offset','byte_length'
+            ])
+            writer.writeheader()
+            writer.writerows(final)
+
+        print(f'完成！共 {len(final)} 条变量')
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 if __name__ == '__main__':
     # Run the main function to process the pcap file and export S7 variables to CSV
     main()
-    print(f"Processing complete. The results have been saved to the CSV file: {csv_file}")
+    print(f"Processing complete. The results have been saved to the CSV file: {CSV_FILE}")
